@@ -1,35 +1,23 @@
-import copy
-import hashlib
-import math
-import os
 import time
-from abc import ABC, abstractmethod
+import math
+import psutil
 from datetime import datetime, timedelta
-from itertools import chain
-from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union
+from typing import Any, Callable, Iterable, List, Mapping, MutableMapping, Optional, Tuple, Union
 
 import pendulum
 import requests
-
-from airbyte_cdk import BackoffStrategy, StreamSlice
-from airbyte_cdk.models import SyncMode, AirbyteMessage, AirbyteStateBlob, AirbyteStreamState, AirbyteStateType, AirbyteStateMessage, StreamDescriptor, Type as MessageType
-#from airbyte_cdk.sources.declarative.requesters.error_handlers.backoff_strategies import ExponentialBackoffStrategy
-#from airbyte_cdk.sources.streams.checkpoint import Cursor
-#from airbyte_cdk.sources.streams.checkpoint.resumable_full_refresh_cursor import ResumableFullRefreshCursor
-#from airbyte_cdk.sources.streams.checkpoint.substream_resumable_full_refresh_cursor import SubstreamResumableFullRefreshCursor
-from airbyte_cdk.sources.streams.core import StreamData
-from source_stripe.utils import safe_stream_state
-#from airbyte_cdk.sources.streams.http import HttpStream, HttpSubStream
-#from airbyte_cdk.sources.streams.http.error_handlers import ErrorHandler
-#from airbyte_cdk.sources.utils.transform import TransformConfig, TypeTransformer
-#from source_stripe.error_handlers import ParentIncrementalStripeSubStreamErrorHandler, StripeErrorHandler
-#from source_stripe.error_mappings import PARENT_INCREMENTAL_STRIPE_SUB_STREAM_ERROR_MAPPING
-from source_stripe.streams import IncrementalStripeStream, UpdatedCursorIncrementalRecordExtractor, StripeStream, IRecordExtractor, Events, EventRecordExtractor, CreatedCursorIncrementalStripeStream, ParentIncrementalStripeSubStream, IStreamSelector, StripeSubStream
+import threading
+import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-
-################################################################ HUBIFI ################################################################
-class IncrementalSearchStripeStream(IncrementalStripeStream):
+from airbyte_cdk import StreamSlice
+from airbyte_cdk.models import SyncMode
+from airbyte_cdk.sources.streams.core import StreamData
+from source_stripe.utils import safe_stream_state
+from source_stripe.streams import IncrementalStripeStream, UpdatedCursorIncrementalRecordExtractor, StripeStream, IRecordExtractor, Events, EventRecordExtractor, CreatedCursorIncrementalStripeStream, ParentIncrementalStripeSubStream, IStreamSelector, StripeSubStream
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from source_stripe.streams import StripeStream
+class ThreadedIncrementalStripeStream(IncrementalStripeStream):
     is_resumable = True
     """
     This class combines both normal incremental sync and event based sync. For initial full refresh sync mode we are using the Search API with custom filters
@@ -39,6 +27,7 @@ class IncrementalSearchStripeStream(IncrementalStripeStream):
     def __init__(
         self,
         *args,
+        path: Optional[str] = None,
         cursor_field: str = "updated",
         legacy_cursor_field: Optional[str] = "created",
         event_types: Optional[List[str]] = None,
@@ -49,30 +38,38 @@ class IncrementalSearchStripeStream(IncrementalStripeStream):
         **kwargs,
     ):
         self._cursor_field = cursor_field
+        self._path = path
+        is_search_api = path and "search" in path
         super().__init__(*args, **kwargs)
-        created_cursor_stream = SearchStripeStream(
+        created_cursor_stream = BoundedThreadedCreatedCursorIncrementalStripeStream(
             *args,
+            path=path,
             cursor_field=cursor_field,
             lookback_window_days=0,
             record_extractor=UpdatedCursorIncrementalRecordExtractor(cursor_field, legacy_cursor_field),
             expand_items=expand_items,
             extra_request_params=extra_request_params,
             max_workers=max_workers,
+            is_search_api=is_search_api,
             **kwargs,
         )
-        updated_cursor_stream = ThreadedUpdatedCursorIncrementalStripeStream( #UpdatedCursorIncrementalStripeStream
+        updated_cursor_stream = ThreadedUpdatedCursorIncrementalStripeStream(
             *args,
+            path=path,
             cursor_field=cursor_field,
             legacy_cursor_field=legacy_cursor_field,
             event_types=event_types,
             expand_items=expand_items,
             response_filter=response_filter,
-            #max_workers=max_workers,
+            max_workers=max_workers,
             **kwargs,
         )
         self._parent_stream = None
-        self.stream_selector = IncrementalSearchStripeStreamSelector(created_cursor_stream, updated_cursor_stream)
+        self.stream_selector = ThreadedIncrementalStripeStreamSelector(created_cursor_stream, updated_cursor_stream)
 
+    @property
+    def path(self) -> Optional[str]:
+        return self._path
 class ThreadedParentIncrementalStripeSubStream(ParentIncrementalStripeSubStream):
     """
     A substream that:
@@ -80,9 +77,7 @@ class ThreadedParentIncrementalStripeSubStream(ParentIncrementalStripeSubStream)
     - Batches parent records into fixed-size groups
     - Fetches parent records concurrently from different slices
     """
-
     is_resumable = True
-    max_workers = 20
 
     @property
     def cursor_field(self) -> str:
@@ -90,76 +85,71 @@ class ThreadedParentIncrementalStripeSubStream(ParentIncrementalStripeSubStream)
 
     def __init__(self, *args, **kwargs):
         self._cursor_field = kwargs.pop("cursor_field")
+        self.max_workers = kwargs.pop("max_workers", 20)
+        self.queue_size = 25000
+        self.memory_log_interval = 5000
+
         super().__init__(cursor_field=self._cursor_field, *args, **kwargs)
 
-    def stream_slices(
-        self,
-        sync_mode: SyncMode,
-        cursor_field: Optional[List[str]] = None,
-        stream_state: Optional[Mapping[str, Any]] = None,
-    ) -> Iterable[Optional[Mapping[str, Any]]]:
-        self.logger.info(f"[child] Starting threaded stream_slices for {self.name}")
+    def _fetch_slice(self, slice_, sync_mode, cursor_field, stream_state):
+        records = []
+        for record in self.parent.read_records(sync_mode, cursor_field, slice_, stream_state):
+            minimal_record = {
+                "id": record["id"],
+                "created": record.get("created"),
+                "updated": record.get("updated"),
+            }
+            records.append(minimal_record)
+        mem = psutil.Process().memory_info().rss / 1024 / 1024
+        self.logger.info(f"[ThreadedParentIncrementalStripeSubStream Generate Slices] Memory usage: {mem:.2f}MB")
+        return records
+
+    def stream_slices(self, sync_mode, cursor_field=None, stream_state=None):
         stream_state = safe_stream_state(stream_state, self.cursor_field) or {}
         if stream_state:
             stream_state = {self.parent.cursor_field: stream_state.get(self.cursor_field, 0)}
 
         parent_slices = list(self.parent.stream_slices(sync_mode=sync_mode, cursor_field=cursor_field, stream_state=stream_state))
-        thread_chunk_size = max(1, len(parent_slices) // self.max_workers)
-        self.logger.info(f"[child] Received {len(parent_slices)} parent slices from parent stream with {thread_chunk_size} batch size")
+        self.logger.info(f"[stream_slices] parent slices {parent_slices}")
 
-        def fetch_records(slice_):
-            start = time.time()
-            records = list(self.parent.read_records(sync_mode, cursor_field, stream_slice=slice_, stream_state=stream_state))
-            self.logger.info(f"[child] Finished slice {slice_} with {len(records)} records in {time.time() - start:.2f}s")
-            return records
-
-        current_batch = []
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = [executor.submit(fetch_records, slice_) for slice_ in parent_slices]
+            futures = [executor.submit(self._fetch_slice, s, sync_mode, cursor_field, stream_state) for s in parent_slices]
             for future in as_completed(futures):
-                parent_records = future.result()
-                for record in parent_records:
-                    current_batch.append(record)
-                    if len(current_batch) >= thread_chunk_size:
-                        self.logger.info(f"[child] Yielding slice with {len(current_batch)} parent records")
-                        yield {"batched_parents": current_batch}
-                        current_batch = []
+                records = future.result()
+                mem = psutil.Process().memory_info().rss / 1024 / 1024
+                self.logger.info(f"[ThreadedParentIncrementalStripeSubStream] Collected {len(records)} parents. Memory usage: {mem:.2f}MB")
+                yield {"batched_parents": records}
 
-        if current_batch:
-            self.logger.info(f"[child] Yielding final slice with {len(current_batch)} parent records")
-            yield {"batched_parents": current_batch}
+    def _process_parent(self, parent_record, sync_mode, cursor_field, stream_state):
+        slice_data = StreamSlice(partition={"parent": parent_record}, cursor_slice={})
+        return super().read_records(sync_mode, cursor_field, slice_data, stream_state)
 
-    def _process_parent_batch(self, parent_batch, sync_mode, cursor_field, stream_state):
-        results = []
-        for parent in parent_batch:
-            slice_data = StreamSlice(partition={"parent": parent}, cursor_slice={})
-            records = super().read_records(sync_mode, cursor_field, slice_data, stream_state)
-            results.extend(records)
-        return results
-
-    def read_records(
-        self,
-        sync_mode: SyncMode,
-        cursor_field: Optional[List[str]] = None,
-        stream_slice: Optional[Mapping[str, Any]] = None,
-        stream_state: Optional[Mapping[str, Any]] = None,
-    ) -> Iterable[Mapping[str, Any]]:
-        batched_parents = stream_slice["batched_parents"]
-        self.logger.info(f"[child] Processing {len(batched_parents)} parents")
-
+    def read_records(self, sync_mode, cursor_field=None, stream_slice=None, stream_state=None):
         stream_state = stream_state or {}
-        thread_chunk_size = max(1, len(batched_parents) // self.max_workers)
+        batched_parents = stream_slice["batched_parents"]
 
-        sub_batches = [batched_parents[i:i + thread_chunk_size] for i in range(0, len(batched_parents), thread_chunk_size)]
-        self.logger.info(f"[child] Processing {len(sub_batches)} sub-batches with up to {self.max_workers} threads")
+        q = queue.Queue(maxsize=self.queue_size)
+        finished = 0
+        processed = 0
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            futures = [
-                pool.submit(self._process_parent_batch, batch, sync_mode, cursor_field, stream_state)
-                for batch in sub_batches
-            ]
-            for future in as_completed(futures):
-                yield from future.result()
+        def child_worker(parent_record):
+            for record in self._process_parent(parent_record, sync_mode, cursor_field, stream_state):
+                q.put(record)
+            q.put(None)
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = [executor.submit(child_worker, parent) for parent in batched_parents]
+            while finished < len(batched_parents):
+                item = q.get()
+                if item is None:
+                    finished += 1
+                else:
+                    yield item
+                    processed += 1
+                    if processed % self.memory_log_interval == 0:
+                        mem = psutil.Process().memory_info().rss / 1024 / 1024
+                        self.logger.info(f"[ThreadedParentIncrementalStripeSubStream ReadRecords] Processed {processed} child records. Memory usage: {mem:.2f}MB")
+
 class ThreadedUpdatedCursorIncrementalStripeStream(StripeStream):
     is_resumable = True
     """
@@ -276,24 +266,28 @@ class ThreadedUpdatedCursorIncrementalStripeStream(StripeStream):
             yield from super().read_records(sync_mode, cursor_field=cursor_field, stream_slice=stream_slice, stream_state=stream_state)
             return
         yield from self.read_event_increments(cursor_field=cursor_field, stream_state=stream_state)
-class SearchStripeStream(CreatedCursorIncrementalStripeStream):
+class BoundedThreadedCreatedCursorIncrementalStripeStream(CreatedCursorIncrementalStripeStream):
+    is_resumable = True
+    state_checkpoint_interval = math.inf
+
     def __init__(
         self,
         *args,
         lookback_window_days: int = 0,
         start_date_max_days_from_now: Optional[int] = None,
         cursor_field: str = "created",
+        is_search_api: bool = False,
         max_workers: int = 20,
+        queue_size=10000,
         **kwargs,
     ):
         self._cursor_field = cursor_field
+        self.is_search_api = is_search_api
         self.max_workers = max_workers
+        self.queue_size = queue_size
         super().__init__(*args, **kwargs)
         self.lookback_window_days = lookback_window_days
         self.start_date_max_days_from_now = start_date_max_days_from_now
-
-    def path(self, *args, **kwargs) -> str:
-        return f"{self.name}/search"
 
     def request_params(
         self,
@@ -301,50 +295,171 @@ class SearchStripeStream(CreatedCursorIncrementalStripeStream):
         stream_slice: Mapping[str, Any] = None,
         next_page_token: Mapping[str, Any] = None,
     ) -> MutableMapping[str, Any]:
-        params = {
-            **self.extra_request_params(
-                stream_state=stream_state,
-                stream_slice=stream_slice,
-                next_page_token=next_page_token,
-            ),
-        }
 
-        if self.expand_items:
-            params["expand[]"] = self.expand_items
+        if self.is_search_api:
+            params = {
+                **(self.extra_request_params(
+                    stream_state=stream_state,
+                    stream_slice=stream_slice,
+                    next_page_token=next_page_token
+                ) or {}),
+                "limit": 100
+            }
+            if next_page_token:
+                params["page"] = next_page_token["page"]
+            if self.expand_items:
+                params["expand[]"] = self.expand_items
+            return params
 
-        if next_page_token:
-            params["page"] = next_page_token["page"]
-        return params
+        else:
+            params = super(CreatedCursorIncrementalStripeStream, self).request_params(
+                stream_state, stream_slice, next_page_token
+            )
+            return {
+                "created[gte]": stream_slice["created[gte]"],
+                "created[lte]": stream_slice["created[lte]"],
+                **params
+            }
 
     def next_page_token(self, response: requests.Response) -> Optional[Mapping[str, Any]]:
         json_resp = response.json()
-        if json_resp.get("has_more") and "next_page" in json_resp:
-            return {"page": json_resp["next_page"]}
-        return None
+
+        if self.is_search_api:
+            if json_resp.get("has_more") and "next_page" in json_resp:
+                return {"page": json_resp["next_page"]}
+            return None
+        else:
+            if json_resp.get("has_more") and json_resp.get("data"):
+                return {"starting_after": json_resp["data"][-1]["id"]}
+            return None
+
+    def stream_slices(self, sync_mode, cursor_field=None, stream_state=None):
+        stream_state = stream_state or {}
+        start_ts = self.get_start_timestamp(stream_state)
+        if start_ts >= pendulum.now().int_timestamp:
+            return []
+        slices = [
+            {"created[gte]": start, "created[lte]": end}
+            for start, end in self.chunk_dates(start_ts)
+        ]
+        return [{"batched_slices": slices}]
+
+    def _read_slice(self, stream_slice, sync_mode, cursor_field, stream_state):
+        return list(super().read_records(
+            sync_mode=sync_mode,
+            cursor_field=cursor_field,
+            stream_slice=stream_slice,
+            stream_state=stream_state,
+        ))
+
+    def read_records(self, sync_mode, cursor_field=None, stream_slice=None, stream_state=None):
+        stream_state = stream_state or {}
+        slices = stream_slice["batched_slices"]
+        q = queue.Queue(maxsize=self.queue_size)
+
+        def worker(slice_):
+            for record in self._read_slice(slice_, sync_mode, cursor_field, stream_state):
+                while True:
+                    try:
+                        q.put(record, timeout=1)
+                        break
+                    except queue.Full:
+                        continue
+            q.put(None)  # Signal worker done
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            for s in slices:
+                executor.submit(worker, s)
+
+            finished = 0
+            while finished < len(slices):
+                item = q.get()
+                if item is None:
+                    finished += 1
+                else:
+                    yield item
+class ThreadedCreatedCursorIncrementalStripeStream(CreatedCursorIncrementalStripeStream):
+    is_resumable = True
+    state_checkpoint_interval = math.inf
+
+    def __init__(
+        self,
+        *args,
+        lookback_window_days: int = 0,
+        start_date_max_days_from_now: Optional[int] = None,
+        cursor_field: str = "created",
+        is_search_api: bool = False,
+        max_workers: int = 20,
+        **kwargs,
+    ):
+        self._cursor_field = cursor_field
+        self.is_search_api = is_search_api
+        self.max_workers = max_workers
+        super().__init__(*args, **kwargs)
+        self.lookback_window_days = lookback_window_days
+        self.start_date_max_days_from_now = start_date_max_days_from_now
+
+    def request_params(
+        self,
+        stream_state: Mapping[str, Any],
+        stream_slice: Mapping[str, Any] = None,
+        next_page_token: Mapping[str, Any] = None,
+    ) -> MutableMapping[str, Any]:
+
+        if self.is_search_api:
+            params = {
+                **(self.extra_request_params(
+                    stream_state=stream_state,
+                    stream_slice=stream_slice,
+                    next_page_token=next_page_token
+                ) or {}),
+                "limit": 100
+            }
+            if next_page_token:
+                params["page"] = next_page_token["page"]
+            if self.expand_items:
+                params["expand[]"] = self.expand_items
+            return params
+
+        else:
+            params = super(CreatedCursorIncrementalStripeStream, self).request_params(
+                stream_state, stream_slice, next_page_token
+            )
+            return {
+                "created[gte]": stream_slice["created[gte]"],
+                "created[lte]": stream_slice["created[lte]"],
+                **params
+            }
+
+    def next_page_token(self, response: requests.Response) -> Optional[Mapping[str, Any]]:
+        json_resp = response.json()
+
+        if self.is_search_api:
+            if json_resp.get("has_more") and "next_page" in json_resp:
+                return {"page": json_resp["next_page"]}
+            return None
+        else:
+            if json_resp.get("has_more") and json_resp.get("data"):
+                return {"starting_after": json_resp["data"][-1]["id"]}
+            return None
 
     def stream_slices(
         self, sync_mode: SyncMode, cursor_field: List[str] = None, stream_state: Mapping[str, Any] = None
     ) -> Iterable[Optional[Mapping[str, Any]]]:
         stream_state = stream_state or {}
         start_ts = self.get_start_timestamp(stream_state)
-        self.logger.info(f"[SearchStripeStream - stream_slices]")
         if start_ts >= pendulum.now().int_timestamp:
-            self.logger.info(f"[SearchStripeStream - return none?]")
             return []
         slices = [
             {"created[gte]": start, "created[lte]": end}
             for start, end in self.chunk_dates(start_ts)
         ]
-        self.logger.info(f"[SearchStripeStream - returning slices: {slices} ]")
 
         return [{"batched_slices": slices}]
 
     def chunk_dates(self, start_date_ts: int) -> Iterable[Tuple[int, int]]:
         now = pendulum.now().int_timestamp
-        self.logger.info(f"[SearchStripeStream - Chunk Dates] SLICE RANGE: {self.slice_range}")
-        step = int(pendulum.duration(days=1).total_seconds())
-        #step = int(pendulum.duration(days=self.slice_range).total_seconds()) #TODO: need to figure out slice_ranges
-        self.logger.info(f"[SearchStripeStream - Chunk Dates] STEP: {step}")
+        step = int(pendulum.duration(days=self.slice_range).total_seconds())
         after_ts = start_date_ts
         while after_ts < now:
             before_ts = min(now, after_ts + step)
@@ -381,10 +496,10 @@ class SearchStripeStream(CreatedCursorIncrementalStripeStream):
             }
             for task in as_completed(tasks):
                 yield from task.result()
-class IncrementalSearchStripeStreamSelector(IStreamSelector):
+class ThreadedIncrementalStripeStreamSelector(IStreamSelector):
     def __init__(
         self,
-        created_cursor_incremental_stream: SearchStripeStream,
+        created_cursor_incremental_stream: CreatedCursorIncrementalStripeStream,
         updated_cursor_incremental_stream: ThreadedUpdatedCursorIncrementalStripeStream
     ):
         self._created_cursor_stream = created_cursor_incremental_stream
@@ -392,81 +507,56 @@ class IncrementalSearchStripeStreamSelector(IStreamSelector):
 
     def get_parent_stream(self, stream_state: Mapping[str, Any]) -> StripeStream:
         return self._updated_cursor_stream if stream_state else self._created_cursor_stream
-
 class CustomerBalanceTransactions(ParentIncrementalStripeSubStream):
     """
-    Custom connector that incrementally collects the id from customers and customer from invoices.
-    It collects these customer IDs and makes a call to retrieve the customer balance transactions.
-    It implements a 2 day window to catch transactions created during previous run or right before
-    the invoice/customer event. To move the cursor along it will also cap to 7 days ago after initial
-    sync. API docs: https://stripe.com/docs/api/customer_balance_transactions/list
+    Optimized threaded version of CustomerBalanceTransactions stream.
+    Uses multiple parent streams (e.g., invoices, customers), threads parent record reading,
+    deduplicates customer IDs, and applies a lookback window for safe incremental syncs.
     """
-    def __init__(self, cursor_field: str, parents: List[StripeSubStream], *args, **kwargs):
-        super().__init__(cursor_field=cursor_field, parent=parents[0], *args, **kwargs)
-        self.parent_streams = parents
 
-    @property
-    def state_checkpoint_interval(self) -> int:
-        return 1  # force state write
+    def __init__(self, cursor_field: str, customerStream: StripeSubStream, invoiceStream: StripeSubStream, max_workers: int = 20, *args, **kwargs):
+        super().__init__(cursor_field=cursor_field, parent=None, *args, **kwargs)
+        self.customerStream = customerStream
+        self.invoiceStream = invoiceStream
+        self.workers = max_workers
+        self.batch_size = 50
 
     def stream_slices(self, sync_mode: SyncMode, cursor_field=None, stream_state=None):
         if stream_state:
+            self.parent_streams = [self.customerStream, self.invoiceStream]
             normalized_state = self.normalize_state(stream_state)
         else:
             stream_state = {}
+            self.parent_streams = [self.customerStream]
             normalized_state = stream_state
-
         seen = set()
         any_records = False
 
+        self.logger.info(f"[CBT] Running parent streams")
         for parent in self.parent_streams:
-            self.logger.info(f"Starting parent stream {parent.name} with state {normalized_state}")
             slices = parent.stream_slices(sync_mode=sync_mode, cursor_field=parent.cursor_field, stream_state=normalized_state)
-
             for stream_slice in slices:
-                records = parent.read_records(sync_mode=sync_mode, cursor_field=parent.cursor_field, stream_slice=stream_slice, stream_state=normalized_state)
-                for r in records:
-                    parent_id = r.get("customer") or r.get("id")
-                    balance = r.get("balance") or r.get("total", 0)
+                parent_records = parent.read_records(
+                    sync_mode=sync_mode, cursor_field=cursor_field, stream_slice=stream_slice, stream_state=normalized_state
+                )
+                for record in parent_records:
+                    parent_id = record.get("customer") or record.get("id")
+                    balance = record.get("balance") or record.get("total", 0)
                     if parent_id and parent_id not in seen and balance != 0:
                         seen.add(parent_id)
                         any_records = True
                         yield {"parent": {"id": parent_id}}
 
-        if not any_records:
-            yield {"parent": {"id": "empty_slice"}}
+            if not any_records:
+                yield {"parent": {"id": "empty_slice"}}
 
     def read_records(self, sync_mode, cursor_field=None, stream_slice=None, stream_state=None):
         state = self.normalize_state(stream_state)
-        lookback = state["cursor"] - int(timedelta(days=2).total_seconds())
+        lookback = state["cursor"] - int(timedelta(days=1).total_seconds())
 
         for record in super().read_records(sync_mode, cursor_field, stream_slice, stream_state):
             if record.get("created", 0) > lookback:
                 yield record
-
-    def read(self, *args, **kwargs):
-        read_count = 0
-
-        for record in super().read(*args, **kwargs):
-            read_count += 1
-            yield record
-
-        if read_count == 1:
-            now = int(datetime.utcnow().timestamp())
-            synthetic = {self.cursor_field: now}
-            state = self.normalize_state(kwargs.get("stream_state"))
-            new_state = self.get_updated_state(state, synthetic)
-            self.logger.info(f"Persisting synthetic state: {new_state}")
-            yield AirbyteMessage(
-                type=MessageType.STATE,
-                state=AirbyteStateMessage(
-                    type=AirbyteStateType.STREAM,
-                    stream=AirbyteStreamState(
-                        stream_descriptor=StreamDescriptor(name=self.name),
-                        stream_state=AirbyteStateBlob(data=new_state)
-                    )
-                )
-            )
 
     def normalize_state(self, state: Optional[Mapping[str, Any]]) -> dict:
         """Unifies legacy and new state format."""
@@ -482,10 +572,10 @@ class CustomerBalanceTransactions(ParentIncrementalStripeSubStream):
 
     def get_updated_state(self, current_state: Mapping[str, Any], latest_record: Mapping[str, Any]) -> Mapping[str, Any]:
 
-        previous_cursor_minus_2 = (current_state or {}).get("cursor", self.start_date) - int(timedelta(days=2).total_seconds())
-        latest_cursor_minus_2 = latest_record.get(self.cursor_field) - int(timedelta(days=2).total_seconds())
-        today_minus_7 = int(datetime.utcnow().timestamp()) - int(timedelta(days=7).total_seconds())
-        new_cursor = max(latest_cursor_minus_2, today_minus_7, previous_cursor_minus_2)
+        previous_cursor_minus_1 = (current_state or {}).get("cursor", self.start_date) - int(timedelta(days=1).total_seconds())
+        latest_cursor_minus_1 = latest_record.get(self.cursor_field) - int(timedelta(days=1).total_seconds())
+        today_minus_3 = int(datetime.utcnow().timestamp()) - int(timedelta(days=3).total_seconds())
+        new_cursor = max(latest_cursor_minus_1, today_minus_3, previous_cursor_minus_1)
         updated_parents = {
             p.name: new_cursor
             for p in self.parent_streams

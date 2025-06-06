@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, List, Mapping, MutableMapping, Optional, Tuple
 
 import pendulum
+import isodate
+from datetime import timedelta
 
 from airbyte_cdk.entrypoint import logger as entrypoint_logger
 from airbyte_cdk.models import ConfiguredAirbyteCatalog, FailureType, SyncMode
@@ -27,12 +29,10 @@ from source_stripe.utils import invoice_event_filter
 
 from source_stripe.streams import (
     CreatedCursorIncrementalStripeStream,
-    CustomerBalanceTransactions,
     Events,
     IncrementalStripeStream,
     ParentIncrementalStripeSubStream,
     SetupAttempts,
-    StripeLazySubStream,
     StripeStream,
     StripeSubStream,
     UpdatedCursorIncrementalStripeLazySubStream,
@@ -41,11 +41,10 @@ from source_stripe.streams import (
 )
 
 from source_stripe.streams_custom import (
-    IncrementalSearchStripeStream,
+    ThreadedIncrementalStripeStream,
     ThreadedParentIncrementalStripeSubStream,
+    CustomerBalanceTransactions,
 )
-
-
 
 logger = logging.getLogger("airbyte")
 
@@ -86,31 +85,40 @@ class SourceStripe(ConcurrentSourceAdapter):
 
     @staticmethod
     def validate_and_fill_with_defaults(config: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
-        lookback_window_days, slice_range = (
-            config.get("lookback_window_days"),
-            config.get("slice_range"),
-        )
-        if lookback_window_days is None:
-            config["lookback_window_days"] = 0
-        elif not isinstance(lookback_window_days, int) or lookback_window_days < 0:
-            message = f"Invalid lookback window {lookback_window_days}. Please use only positive integer values or 0."
+        lookback_window_days = config.get("lookback_window_days", 0)
+        slice_range_days = config.get("slice_range", 1.0)  # Accept float day values by default
+        slice_range_iso = config.get("slice_range_iso")
+
+        # Validate lookback_window_days
+        if not isinstance(lookback_window_days, int) or lookback_window_days < 0:
             raise AirbyteTracedException(
-                message=message,
-                internal_message=message,
+                message=f"Invalid lookback_window_days: {lookback_window_days}. Must be a non-negative integer.",
                 failure_type=FailureType.config_error,
             )
 
-        # verifies the start_date in the config is valid
-        SourceStripe._start_date_to_timestamp(config)
-        if slice_range is None:
+        config["lookback_window_days"] = lookback_window_days
+
+        # Handle ISO 8601 slice range
+        if slice_range_iso:
+            try:
+                iso_duration = isodate.parse_duration(slice_range_iso)
+                if not isinstance(iso_duration, timedelta):
+                    raise TypeError("Parsed ISO duration is not a timedelta")
+                #config["slice_range"] = iso_duration
+                config["slice_range"] = iso_duration.total_seconds() / 86400.0  # normalize to float days
+
+            except Exception as e:
+                raise AirbyteTracedException(
+                    message=f"Invalid ISO 8601 duration: {slice_range_iso}",
+                    internal_message=str(e),
+                    failure_type=FailureType.config_error,
+                )
+        # Handle numeric day-based slice range (int or float)
+        elif isinstance(slice_range_days, (int, float)) and slice_range_days > 0:
+            config["slice_range"] = float(slice_range_days)
+        else:
             config["slice_range"] = 365
-        elif not isinstance(slice_range, int) or slice_range < 1:
-            message = f"Invalid slice range value {slice_range}. Please use positive integer values only."
-            raise AirbyteTracedException(
-                message=message,
-                internal_message=message,
-                failure_type=FailureType.config_error,
-            )
+        config["max_workers"] = min(config.get("num_workers", _DEFAULT_CONCURRENCY), _MAX_CONCURRENCY)
         return config
 
     def check_connection(self, logger: logging.Logger, config: MutableMapping[str, Any]) -> Tuple[bool, Any]:
@@ -141,10 +149,14 @@ class SourceStripe(ConcurrentSourceAdapter):
     def customers(**args):
         # The Customers stream is instantiated in a dedicated method to allow parametrization and avoid duplicated code.
         # It can be used with and without expanded items (as an independent stream or as a parent stream for other streams).
-        return IncrementalStripeStream(
+        return ThreadedIncrementalStripeStream(
             name="customers",
-            path="customers",
+            path="customers/search",
             use_cache=USE_CACHE,
+            extra_request_params=lambda self, stream_slice, *args, **kwargs: {
+                "query": (f"created >= {stream_slice['created[gte]']} AND created <= {stream_slice['created[lte]']}"),
+                "limit": 100
+            },
             event_types=["customer.created", "customer.updated", "customer.deleted"],
             **args,
         )
@@ -166,7 +178,7 @@ class SourceStripe(ConcurrentSourceAdapter):
         :return:
         """
 
-        max_call_rate = 25 if self.is_test_account(config) else 100
+        max_call_rate = 75 if self.is_test_account(config) else 100
         if config.get("call_rate_limit"):
             call_limit = config["call_rate_limit"]
             if call_limit > max_call_rate:
@@ -198,11 +210,18 @@ class SourceStripe(ConcurrentSourceAdapter):
     def streams(self, config: MutableMapping[str, Any]) -> List[Stream]:
         args = self._get_stream_base_args(config)
         incremental_args = {**args, "lookback_window_days": config["lookback_window_days"]}
-        subscriptions = IncrementalStripeStream(
+        override_start_date = self._start_date_to_timestamp(config, "override_start_date")
+        override_args = {**args, "start_date": override_start_date} if override_start_date else args
+
+        subscriptions = ThreadedIncrementalStripeStream(
             name="subscriptions",
-            path="subscriptions",
+            path="subscriptions/search",
             use_cache=USE_CACHE,
-            extra_request_params={"status": "all"},
+            max_workers=config.get("max_workers", 20),
+            extra_request_params=lambda self, stream_slice, *args, **kwargs: {
+                "query": (f"-status:'incomplete' AND -status:'incomplete_expired' AND created >= {stream_slice['created[gte]']} AND created <= {stream_slice['created[lte]']}"),
+                "limit": 100
+            },
             event_types=[
                 "customer.subscription.created",
                 "customer.subscription.paused",
@@ -213,9 +232,9 @@ class SourceStripe(ConcurrentSourceAdapter):
                 "customer.subscription.updated",
                 "customer.subscription.deleted",
             ],
-            **args,
+            **override_args,
         )
-        subscription_items = ParentIncrementalStripeSubStream(
+        subscription_items = ThreadedParentIncrementalStripeSubStream(
             name="subscription_items",
             path="subscription_items",
             parent=subscriptions,
@@ -235,17 +254,28 @@ class SourceStripe(ConcurrentSourceAdapter):
             event_types=["transfer.created", "transfer.reversed", "transfer.updated"],
             **args,
         )
-        application_fees = IncrementalStripeStream(
+        application_fees = ThreadedIncrementalStripeStream(
             name="application_fees",
             path="application_fees",
             use_cache=USE_CACHE,
+            max_workers=config.get("max_workers", 20),
             event_types=["application_fee.created", "application_fee.refunded"],
             **args,
         )
-        invoices = IncrementalSearchStripeStream(
+        customers = ThreadedIncrementalStripeStream(
+            name="customers",
+            path="customers",
+            use_cache=USE_CACHE,
+            max_workers=config.get("max_workers", 20),
+            event_types=["customer.created", "customer.updated", "customer.deleted"],
+            **override_args,
+        )
+        invoices = ThreadedIncrementalStripeStream(
             name="invoices",
+            path="invoices/search",
+            use_cache=USE_CACHE,
             response_filter=invoice_event_filter,
-            max_workers=20,#TODO: parameterize
+            max_workers=config.get("max_workers", 20),
             expand_items=["data.discounts", "data.total_tax_amounts.tax_rate"],
             extra_request_params=lambda self, stream_slice, *args, **kwargs: {
                 "query": (f"-total=0 AND -status:'draft' AND created >= {stream_slice['created[gte]']} AND created <= {stream_slice['created[lte]']}"),
@@ -357,7 +387,7 @@ class SourceStripe(ConcurrentSourceAdapter):
                 ],
                 **args,
             ),
-            UpdatedCursorIncrementalStripeStream(
+            ThreadedIncrementalStripeStream(
                 name="credit_notes",
                 path="credit_notes",
                 event_types=["credit_note.created", "credit_note.updated", "credit_note.voided"],
@@ -375,17 +405,21 @@ class SourceStripe(ConcurrentSourceAdapter):
                 event_types=["issuing_authorization.created", "issuing_authorization.request", "issuing_authorization.updated"],
                 **args,
             ),
-            self.customers(**args),
             IncrementalStripeStream(
                 name="cardholders",
                 path="issuing/cardholders",
                 event_types=["issuing_cardholder.created", "issuing_cardholder.updated"],
                 **args,
             ),
-            IncrementalStripeStream(
+            ThreadedIncrementalStripeStream(
                 name="charges",
-                path="charges",
+                path="charges/search",
+                max_workers=config.get("max_workers", 20),
                 expand_items=["data.refunds"],
+                extra_request_params=lambda self, stream_slice, *args, **kwargs: {
+                    "query": (f"created >= {stream_slice['created[gte]']} AND created <= {stream_slice['created[lte]']}"),
+                    "limit": 100
+                },
                 event_types=[
                     "charge.captured",
                     "charge.expired",
@@ -396,7 +430,7 @@ class SourceStripe(ConcurrentSourceAdapter):
                     "charge.succeeded",
                     "charge.updated",
                 ],
-                **args,
+                **override_args,
             ),
             IncrementalStripeStream(
                 name="coupons", path="coupons", event_types=["coupon.created", "coupon.updated", "coupon.deleted"], **args
@@ -415,6 +449,7 @@ class SourceStripe(ConcurrentSourceAdapter):
             ),
             application_fees,
             invoices,
+            customers,
             IncrementalStripeStream(
                 name="invoice_items",
                 path="invoiceitems",
@@ -468,9 +503,10 @@ class SourceStripe(ConcurrentSourceAdapter):
                 **args,
             ),
             transfers,
-            IncrementalStripeStream(
+            ThreadedIncrementalStripeStream(
                 name="payment_intents",
                 path="payment_intents",
+                max_workers=config.get("max_workers", 20),
                 event_types=[
                     "payment_intent.amount_capturable_updated",
                     "payment_intent.canceled",
@@ -481,7 +517,7 @@ class SourceStripe(ConcurrentSourceAdapter):
                     "payment_intent.requires_action",
                     "payment_intent.succeeded",
                 ],
-                **args,
+                **override_args,
             ),
             IncrementalStripeStream(
                 name="promotion_codes",
@@ -556,11 +592,21 @@ class SourceStripe(ConcurrentSourceAdapter):
                 },
                 **args,
             ),
+            CustomerBalanceTransactions(
+                name="customer_balance_transactions",
+                path=lambda self, stream_slice, *args, **kwargs: f"customers/{stream_slice['parent']['id']}/balance_transactions",
+                customerStream=customers,
+                invoiceStream=invoices,
+                max_workers=config.get("max_workers", 20),
+                cursor_field="created",
+                **args,
+            ),
             ThreadedParentIncrementalStripeSubStream(
                 name="invoice_line_items",
                 path=lambda self, stream_slice, *args, **kwargs: f"invoices/{stream_slice['parent']['id']}/lines",
                 parent=invoices,
                 cursor_field="invoice_updated",
+                max_workers=config.get("max_workers", 20),
                 slice_data_retriever=lambda record, stream_slice: {
                     "invoice_id": stream_slice["parent"]["id"],
                     "invoice_created": stream_slice["parent"]["created"],
@@ -577,13 +623,6 @@ class SourceStripe(ConcurrentSourceAdapter):
                 cursor_field="created",
                 **args,
             ),
-            CustomerBalanceTransactions(
-                name="customer_balance_transactions",
-                path=lambda self, stream_slice, *args, **kwargs: f"customers/{stream_slice['parent']['id']}/balance_transactions",
-                parents=[invoices, self.customers(**args)],
-                cursor_field="created",
-                **args,
-            ),
             StripeSubStream(
                 name="usage_records",
                 path=lambda self,
@@ -597,6 +636,7 @@ class SourceStripe(ConcurrentSourceAdapter):
         ]
 
         state_manager = ConnectorStateManager(state=self._state)
+
         return [
             self._to_concurrent(
                 stream,
@@ -646,15 +686,16 @@ class SourceStripe(ConcurrentSourceAdapter):
         return {}
 
     @staticmethod
-    def _start_date_to_timestamp(config: Mapping[str, Any]) -> int:
-        if "start_date" not in config:
-            return pendulum.datetime(2017, 1, 25).int_timestamp  # type: ignore  # pendulum not typed
+    def _start_date_to_timestamp(config: Mapping[str, Any], field_name: str = "start_date") -> int:
+        """Flexible version that can handle both start_date and start_date_override"""
+        if field_name not in config or not config[field_name]:
+            return pendulum.datetime(2017, 1, 25).int_timestamp  # type: ignore  # default fallback
 
-        start_date = config["start_date"]
+        date_str = config[field_name]
         try:
-            return pendulum.parse(start_date).int_timestamp  # type: ignore  # pendulum not typed
+            return pendulum.parse(date_str).int_timestamp  # type: ignore
         except pendulum.parsing.exceptions.ParserError as e:
-            message = f"Invalid start date {start_date}. Please use YYYY-MM-DDTHH:MM:SSZ format."
+            message = f"Invalid {field_name} {date_str}. Please use YYYY-MM-DDTHH:MM:SSZ format."
             raise AirbyteTracedException(
                 message=message,
                 internal_message=message,
