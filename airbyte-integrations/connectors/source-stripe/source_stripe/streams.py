@@ -282,6 +282,7 @@ class CreatedCursorIncrementalStripeStream(StripeStream):
     def chunk_dates(self, start_date_ts: int) -> Iterable[Tuple[int, int]]:
         now = pendulum.now().int_timestamp
         step = int(pendulum.duration(days=self.slice_range).total_seconds())
+        step = int(pendulum.duration(minutes=1).total_seconds())
         after_ts = start_date_ts
         while after_ts < now:
             before_ts = min(now, after_ts + step)
@@ -1026,66 +1027,66 @@ class SearchStripeStream(CreatedCursorIncrementalStripeStream):
         if json_resp.get("has_more") and "next_page" in json_resp:
             return {"page": json_resp["next_page"]}
         return None
-
-    def stream_slices(
-        self, sync_mode: SyncMode, cursor_field: List[str] = None, stream_state: Mapping[str, Any] = None
-    ) -> Iterable[Optional[Mapping[str, Any]]]:
-        stream_state = stream_state or {}
-        start_ts = self.get_start_timestamp(stream_state)
-        self.logger.info(f"[SearchStripeStream - stream_slices]")
-        if start_ts >= pendulum.now().int_timestamp:
-            self.logger.info(f"[SearchStripeStream - return none?]")
-            return []
-        slices = [
-            {"created[gte]": start, "created[lte]": end}
-            for start, end in self.chunk_dates(start_ts)
-        ]
-        self.logger.info(f"[SearchStripeStream - returning slices: {slices} ]")
-
-        return [{"batched_slices": slices}]
-
-    def chunk_dates(self, start_date_ts: int) -> Iterable[Tuple[int, int]]:
-        now = pendulum.now().int_timestamp
-        self.logger.info(f"[SearchStripeStream - Chunk Dates] SLICE RANGE: {self.slice_range}")
-        step = int(pendulum.duration(days=1).total_seconds())
-        #step = int(pendulum.duration(days=self.slice_range).total_seconds()) #TODO: need to figure out slice_ranges
-        self.logger.info(f"[SearchStripeStream - Chunk Dates] STEP: {step}")
-        after_ts = start_date_ts
-        while after_ts < now:
-            before_ts = min(now, after_ts + step)
-            yield after_ts, before_ts
-            after_ts = before_ts + 1
-
-    def _read_slice(self, stream_slice, sync_mode, cursor_field, stream_state):
-        return list(super().read_records(
-            sync_mode=sync_mode,
-            cursor_field=cursor_field,
-            stream_slice=stream_slice,
-            stream_state=stream_state,
-        ))
-
-    def read_records(
-        self,
-        sync_mode: SyncMode,
-        cursor_field: Optional[List[str]] = None,
-        stream_slice: Optional[Mapping[str, Any]] = None,
-        stream_state: Optional[Mapping[str, Any]] = None,
-    ) -> Iterable[StreamData]:
-        """
-        Run all stream slices concurrently during full refresh or initial sync.
-        Ignore Airbyte's default slice-by-slice invocation pattern.
-        """
-        stream_state = stream_state or {}
-        slices = stream_slice["batched_slices"]
-        max_workers =  min(len(slices), self.max_workers)
-        self.logger.info(f"{len(slices)} slices to process with {self.max_workers} threads!!!")
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as thread_pool:
-            tasks = {
-                thread_pool.submit(self._read_slice, s, sync_mode, cursor_field, stream_state): s for s in slices
-            }
-            for task in as_completed(tasks):
-                yield from task.result()
+#
+#    def stream_slices(
+#        self, sync_mode: SyncMode, cursor_field: List[str] = None, stream_state: Mapping[str, Any] = None
+#    ) -> Iterable[Optional[Mapping[str, Any]]]:
+#        stream_state = stream_state or {}
+#        start_ts = self.get_start_timestamp(stream_state)
+#        self.logger.info(f"[SearchStripeStream - stream_slices]")
+#        if start_ts >= pendulum.now().int_timestamp:
+#            self.logger.info(f"[SearchStripeStream - return none?]")
+#            return []
+#        slices = [
+#            {"created[gte]": start, "created[lte]": end}
+#            for start, end in self.chunk_dates(start_ts)
+#        ]
+#        self.logger.info(f"[SearchStripeStream - returning slices: {slices} ]")
+#
+#        return [{"batched_slices": slices}]
+#
+#    def chunk_dates(self, start_date_ts: int) -> Iterable[Tuple[int, int]]:
+#        now = pendulum.now().int_timestamp
+#        self.logger.info(f"[SearchStripeStream - Chunk Dates] SLICE RANGE: {self.slice_range}")
+#        step = int(pendulum.duration(days=1).total_seconds())
+#        #step = int(pendulum.duration(days=self.slice_range).total_seconds()) #TODO: need to figure out slice_ranges
+#        self.logger.info(f"[SearchStripeStream - Chunk Dates] STEP: {step}")
+#        after_ts = start_date_ts
+#        while after_ts < now:
+#            before_ts = min(now, after_ts + step)
+#            yield after_ts, before_ts
+#            after_ts = before_ts + 1
+#
+#    def _read_slice(self, stream_slice, sync_mode, cursor_field, stream_state):
+#        return list(super().read_records(
+#            sync_mode=sync_mode,
+#            cursor_field=cursor_field,
+#            stream_slice=stream_slice,
+#            stream_state=stream_state,
+#        ))
+#
+#    def read_records(
+#        self,
+#        sync_mode: SyncMode,
+#        cursor_field: Optional[List[str]] = None,
+#        stream_slice: Optional[Mapping[str, Any]] = None,
+#        stream_state: Optional[Mapping[str, Any]] = None,
+#    ) -> Iterable[StreamData]:
+#        """
+#        Run all stream slices concurrently during full refresh or initial sync.
+#        Ignore Airbyte's default slice-by-slice invocation pattern.
+#        """
+#        stream_state = stream_state or {}
+#        slices = stream_slice["batched_slices"]
+#        max_workers =  min(len(slices), self.max_workers)
+#        self.logger.info(f"{len(slices)} slices to process with {self.max_workers} threads!!!")
+#
+#        with ThreadPoolExecutor(max_workers=self.max_workers) as thread_pool:
+#            tasks = {
+#                thread_pool.submit(self._read_slice, s, sync_mode, cursor_field, stream_state): s for s in slices
+#            }
+#            for task in as_completed(tasks):
+#                yield from task.result()
 
 class IncrementalSearchStripeStreamSelector(IStreamSelector):
     def __init__(

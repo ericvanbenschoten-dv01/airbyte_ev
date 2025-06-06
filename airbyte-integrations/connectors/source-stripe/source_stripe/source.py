@@ -42,6 +42,7 @@ from source_stripe.streams import (
 
 from source_stripe.streams_custom import (
     IncrementalSearchStripeStream,
+    ThreadedParentIncrementalStripeSubStream,
 )
 
 
@@ -555,7 +556,7 @@ class SourceStripe(ConcurrentSourceAdapter):
                 },
                 **args,
             ),
-            ParentIncrementalStripeSubStream(
+            ThreadedParentIncrementalStripeSubStream(
                 name="invoice_line_items",
                 path=lambda self, stream_slice, *args, **kwargs: f"invoices/{stream_slice['parent']['id']}/lines",
                 parent=invoices,

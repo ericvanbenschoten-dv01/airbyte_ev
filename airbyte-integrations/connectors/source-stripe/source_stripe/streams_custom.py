@@ -2,6 +2,7 @@ import copy
 import hashlib
 import math
 import os
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from itertools import chain
@@ -17,6 +18,7 @@ from airbyte_cdk.models import SyncMode, AirbyteMessage, AirbyteStateBlob, Airby
 #from airbyte_cdk.sources.streams.checkpoint.resumable_full_refresh_cursor import ResumableFullRefreshCursor
 #from airbyte_cdk.sources.streams.checkpoint.substream_resumable_full_refresh_cursor import SubstreamResumableFullRefreshCursor
 from airbyte_cdk.sources.streams.core import StreamData
+from source_stripe.utils import safe_stream_state
 #from airbyte_cdk.sources.streams.http import HttpStream, HttpSubStream
 #from airbyte_cdk.sources.streams.http.error_handlers import ErrorHandler
 #from airbyte_cdk.sources.utils.transform import TransformConfig, TypeTransformer
@@ -70,6 +72,94 @@ class IncrementalSearchStripeStream(IncrementalStripeStream):
         )
         self._parent_stream = None
         self.stream_selector = IncrementalSearchStripeStreamSelector(created_cursor_stream, updated_cursor_stream)
+
+class ThreadedParentIncrementalStripeSubStream(ParentIncrementalStripeSubStream):
+    """
+    A substream that:
+    - Runs the parent stream in the same sync mode
+    - Batches parent records into fixed-size groups
+    - Fetches parent records concurrently from different slices
+    """
+
+    is_resumable = True
+    max_workers = 20
+
+    @property
+    def cursor_field(self) -> str:
+        return self._cursor_field
+
+    def __init__(self, *args, **kwargs):
+        self._cursor_field = kwargs.pop("cursor_field")
+        super().__init__(cursor_field=self._cursor_field, *args, **kwargs)
+
+    def stream_slices(
+        self,
+        sync_mode: SyncMode,
+        cursor_field: Optional[List[str]] = None,
+        stream_state: Optional[Mapping[str, Any]] = None,
+    ) -> Iterable[Optional[Mapping[str, Any]]]:
+        self.logger.info(f"[child] Starting threaded stream_slices for {self.name}")
+        stream_state = safe_stream_state(stream_state, self.cursor_field) or {}
+        if stream_state:
+            stream_state = {self.parent.cursor_field: stream_state.get(self.cursor_field, 0)}
+
+        parent_slices = list(self.parent.stream_slices(sync_mode=sync_mode, cursor_field=cursor_field, stream_state=stream_state))
+        thread_chunk_size = max(1, len(parent_slices) // self.max_workers)
+        self.logger.info(f"[child] Received {len(parent_slices)} parent slices from parent stream with {thread_chunk_size} batch size")
+
+        def fetch_records(slice_):
+            start = time.time()
+            records = list(self.parent.read_records(sync_mode, cursor_field, stream_slice=slice_, stream_state=stream_state))
+            self.logger.info(f"[child] Finished slice {slice_} with {len(records)} records in {time.time() - start:.2f}s")
+            return records
+
+        current_batch = []
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = [executor.submit(fetch_records, slice_) for slice_ in parent_slices]
+            for future in as_completed(futures):
+                parent_records = future.result()
+                for record in parent_records:
+                    current_batch.append(record)
+                    if len(current_batch) >= thread_chunk_size:
+                        self.logger.info(f"[child] Yielding slice with {len(current_batch)} parent records")
+                        yield {"batched_parents": current_batch}
+                        current_batch = []
+
+        if current_batch:
+            self.logger.info(f"[child] Yielding final slice with {len(current_batch)} parent records")
+            yield {"batched_parents": current_batch}
+
+    def _process_parent_batch(self, parent_batch, sync_mode, cursor_field, stream_state):
+        results = []
+        for parent in parent_batch:
+            slice_data = StreamSlice(partition={"parent": parent}, cursor_slice={})
+            records = super().read_records(sync_mode, cursor_field, slice_data, stream_state)
+            results.extend(records)
+        return results
+
+    def read_records(
+        self,
+        sync_mode: SyncMode,
+        cursor_field: Optional[List[str]] = None,
+        stream_slice: Optional[Mapping[str, Any]] = None,
+        stream_state: Optional[Mapping[str, Any]] = None,
+    ) -> Iterable[Mapping[str, Any]]:
+        batched_parents = stream_slice["batched_parents"]
+        self.logger.info(f"[child] Processing {len(batched_parents)} parents")
+
+        stream_state = stream_state or {}
+        thread_chunk_size = max(1, len(batched_parents) // self.max_workers)
+
+        sub_batches = [batched_parents[i:i + thread_chunk_size] for i in range(0, len(batched_parents), thread_chunk_size)]
+        self.logger.info(f"[child] Processing {len(sub_batches)} sub-batches with up to {self.max_workers} threads")
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+            futures = [
+                pool.submit(self._process_parent_batch, batch, sync_mode, cursor_field, stream_state)
+                for batch in sub_batches
+            ]
+            for future in as_completed(futures):
+                yield from future.result()
 class ThreadedUpdatedCursorIncrementalStripeStream(StripeStream):
     is_resumable = True
     """
@@ -282,16 +372,15 @@ class SearchStripeStream(CreatedCursorIncrementalStripeStream):
         """
         stream_state = stream_state or {}
         slices = stream_slice["batched_slices"]
-        max_workers =  min(len(slices), self.max_workers)
-        self.logger.info(f"{len(slices)} slices to process with {self.max_workers} threads!!!")
+        _max_workers =  min(len(slices), self.max_workers)
+        self.logger.info(f"{len(slices)} slices to process with {_max_workers} threads!!!")
 
-        with ThreadPoolExecutor(max_workers=self.max_workers) as thread_pool:
+        with ThreadPoolExecutor(max_workers=_max_workers) as thread_pool:
             tasks = {
                 thread_pool.submit(self._read_slice, s, sync_mode, cursor_field, stream_state): s for s in slices
             }
             for task in as_completed(tasks):
                 yield from task.result()
-
 class IncrementalSearchStripeStreamSelector(IStreamSelector):
     def __init__(
         self,
