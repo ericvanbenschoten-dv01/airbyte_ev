@@ -23,6 +23,8 @@ from airbyte_cdk.sources.streams.concurrent.cursor import ConcurrentCursor, Curs
 from airbyte_cdk.sources.streams.concurrent.state_converters.datetime_stream_state_converter import EpochValueConcurrentStreamStateConverter
 from airbyte_cdk.sources.streams.http.requests_native_auth import TokenAuthenticator
 from airbyte_cdk.utils.traced_exception import AirbyteTracedException
+from source_stripe.utils import invoice_event_filter
+
 from source_stripe.streams import (
     CreatedCursorIncrementalStripeStream,
     CustomerBalanceTransactions,
@@ -37,6 +39,11 @@ from source_stripe.streams import (
     UpdatedCursorIncrementalStripeStream,
     UpdatedCursorIncrementalStripeSubStream,
 )
+
+from source_stripe.streams_custom import (
+    IncrementalSearchStripeStream,
+)
+
 
 
 logger = logging.getLogger("airbyte")
@@ -234,11 +241,15 @@ class SourceStripe(ConcurrentSourceAdapter):
             event_types=["application_fee.created", "application_fee.refunded"],
             **args,
         )
-        invoices = IncrementalStripeStream(
+        invoices = IncrementalSearchStripeStream(
             name="invoices",
-            path="invoices",
-            use_cache=USE_CACHE,
+            response_filter=invoice_event_filter,
+            max_workers=20,#TODO: parameterize
             expand_items=["data.discounts", "data.total_tax_amounts.tax_rate"],
+            extra_request_params=lambda self, stream_slice, *args, **kwargs: {
+                "query": (f"-total=0 AND -status:'draft' AND created >= {stream_slice['created[gte]']} AND created <= {stream_slice['created[lte]']}"),
+                "limit": 100
+            },
             event_types=[
                 "invoice.created",
                 "invoice.deleted",
