@@ -151,12 +151,8 @@ class SourceStripe(ConcurrentSourceAdapter):
         # It can be used with and without expanded items (as an independent stream or as a parent stream for other streams).
         return ThreadedIncrementalStripeStream(
             name="customers",
-            path="customers/search",
+            path="customers",
             use_cache=USE_CACHE,
-            extra_request_params=lambda self, stream_slice, *args, **kwargs: {
-                "query": (f"created >= {stream_slice['created[gte]']} AND created <= {stream_slice['created[lte]']}"),
-                "limit": 100
-            },
             event_types=["customer.created", "customer.updated", "customer.deleted"],
             **args,
         )
@@ -232,6 +228,7 @@ class SourceStripe(ConcurrentSourceAdapter):
                 "customer.subscription.updated",
                 "customer.subscription.deleted",
             ],
+            inject_subscription_cancellations=True,
             **override_args,
         )
         subscription_items = ThreadedParentIncrementalStripeSubStream(
@@ -262,12 +259,28 @@ class SourceStripe(ConcurrentSourceAdapter):
             event_types=["application_fee.created", "application_fee.refunded"],
             **args,
         )
+        #customers = ThreadedIncrementalStripeStream(
+        #    name="customers",
+        #    path="customers/search",
+        #    use_cache=USE_CACHE,
+        #    max_workers=config.get("max_workers", 20),
+        #    extra_request_params=lambda self, stream_slice, *args, **kwargs: {
+        #        "query": (f"created >= {stream_slice['created[gte]']} AND created <= {stream_slice['created[lte]']}"),
+        #        "limit": 100
+        #    },
+        #    event_types=["customer.created", "customer.updated", "customer.deleted"],
+        #    **override_args,
+        #)
         customers = ThreadedIncrementalStripeStream(
             name="customers",
             path="customers",
             use_cache=USE_CACHE,
             max_workers=config.get("max_workers", 20),
             event_types=["customer.created", "customer.updated", "customer.deleted"],
+            #extra_request_params=lambda self, stream_slice, *args, **kwargs: {
+            #    "query": (f"created >= {stream_slice['created[gte]']} AND created <= {stream_slice['created[lte]']}"),
+            #    "limit": 100
+            #},
             **override_args,
         )
         invoices = ThreadedIncrementalStripeStream(
@@ -413,13 +426,13 @@ class SourceStripe(ConcurrentSourceAdapter):
             ),
             ThreadedIncrementalStripeStream(
                 name="charges",
-                path="charges/search",
+                path="charges",
                 max_workers=config.get("max_workers", 20),
                 expand_items=["data.refunds"],
-                extra_request_params=lambda self, stream_slice, *args, **kwargs: {
-                    "query": (f"created >= {stream_slice['created[gte]']} AND created <= {stream_slice['created[lte]']}"),
-                    "limit": 100
-                },
+                #extra_request_params=lambda self, stream_slice, *args, **kwargs: {
+                #    "query": (f"created >= {stream_slice['created[gte]']} AND created <= {stream_slice['created[lte]']}"),
+                #    "limit": 100
+                #},
                 event_types=[
                     "charge.captured",
                     "charge.expired",

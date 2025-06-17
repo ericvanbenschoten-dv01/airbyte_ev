@@ -40,7 +40,7 @@ connectionSpecification:
       pattern: ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$
       description: >-
         Override UTC date and time in the format 2017-01-25T00:00:00Z for initial sync. Only data generated
-        after this date will be replicated for charges, subscriptions, customers, payment_intents, credit_notes.
+        after this date will be replicated for charges, credit_notes, customers, payment_intents, subscriptions.
       default: "2017-01-25T00:00:00Z"
       examples:
         - "2017-01-25T00:00:00Z"

@@ -35,6 +35,7 @@ class ThreadedIncrementalStripeStream(IncrementalStripeStream):
         expand_items: Optional[List[str]] = None,
         max_workers: int = 20,
         extra_request_params: Optional[Union[Mapping[str, Any], Callable]] = None,
+        inject_subscription_cancellations: bool = False,
         **kwargs,
     ):
         self._cursor_field = cursor_field
@@ -51,6 +52,7 @@ class ThreadedIncrementalStripeStream(IncrementalStripeStream):
             extra_request_params=extra_request_params,
             max_workers=max_workers,
             is_search_api=is_search_api,
+            inject_subscription_cancellations=inject_subscription_cancellations,
             **kwargs,
         )
         updated_cursor_stream = ThreadedUpdatedCursorIncrementalStripeStream(
@@ -86,8 +88,8 @@ class ThreadedParentIncrementalStripeSubStream(ParentIncrementalStripeSubStream)
     def __init__(self, *args, **kwargs):
         self._cursor_field = kwargs.pop("cursor_field")
         self.max_workers = kwargs.pop("max_workers", 20)
-        self.queue_size = 25000
-        self.memory_log_interval = 5000
+        self.queue_size = 10000
+        #self.memory_log_interval = 5000
 
         super().__init__(cursor_field=self._cursor_field, *args, **kwargs)
 
@@ -116,8 +118,6 @@ class ThreadedParentIncrementalStripeSubStream(ParentIncrementalStripeSubStream)
             futures = [executor.submit(self._fetch_slice, s, sync_mode, cursor_field, stream_state) for s in parent_slices]
             for future in as_completed(futures):
                 records = future.result()
-                mem = psutil.Process().memory_info().rss / 1024 / 1024
-                self.logger.info(f"[ThreadedParentIncrementalStripeSubStream] Collected {len(records)} parents. Memory usage: {mem:.2f}MB")
                 yield {"batched_parents": records}
 
     def _process_parent(self, parent_record, sync_mode, cursor_field, stream_state):
@@ -146,9 +146,6 @@ class ThreadedParentIncrementalStripeSubStream(ParentIncrementalStripeSubStream)
                 else:
                     yield item
                     processed += 1
-                    if processed % self.memory_log_interval == 0:
-                        mem = psutil.Process().memory_info().rss / 1024 / 1024
-                        self.logger.info(f"[ThreadedParentIncrementalStripeSubStream ReadRecords] Processed {processed} child records. Memory usage: {mem:.2f}MB")
 
 class ThreadedUpdatedCursorIncrementalStripeStream(StripeStream):
     is_resumable = True
@@ -279,6 +276,7 @@ class BoundedThreadedCreatedCursorIncrementalStripeStream(CreatedCursorIncrement
         is_search_api: bool = False,
         max_workers: int = 20,
         queue_size=10000,
+        inject_subscription_cancellations: bool = False,
         **kwargs,
     ):
         self._cursor_field = cursor_field
@@ -288,6 +286,7 @@ class BoundedThreadedCreatedCursorIncrementalStripeStream(CreatedCursorIncrement
         super().__init__(*args, **kwargs)
         self.lookback_window_days = lookback_window_days
         self.start_date_max_days_from_now = start_date_max_days_from_now
+        self.inject_subscription_cancellations = inject_subscription_cancellations
 
     def request_params(
         self,
@@ -312,7 +311,7 @@ class BoundedThreadedCreatedCursorIncrementalStripeStream(CreatedCursorIncrement
             return params
 
         else:
-            params = super(CreatedCursorIncrementalStripeStream, self).request_params(
+            params = super(BoundedThreadedCreatedCursorIncrementalStripeStream, self).request_params(
                 stream_state, stream_slice, next_page_token
             )
             return {
@@ -359,13 +358,34 @@ class BoundedThreadedCreatedCursorIncrementalStripeStream(CreatedCursorIncrement
 
         def worker(slice_):
             for record in self._read_slice(slice_, sync_mode, cursor_field, stream_state):
-                while True:
-                    try:
-                        q.put(record, timeout=1)
-                        break
-                    except queue.Full:
-                        continue
-            q.put(None)  # Signal worker done
+                if (self.inject_subscription_cancellations and
+                    self.name == "subscriptions" and
+                    record.get("status") == "canceled" and
+                    record.get("cancel_at_period_end") is False and
+                    (record.get("cancel_at") or record.get("canceled_at"))):
+                    # Calculate the new updated with cancellation timestamp
+                    updated_cancel_ts = max(record.get("cancel_at", 0) or 0, record.get("canceled_at", 0) or 0)
+                    updated_synthetic = min(record.get("updated", updated_cancel_ts), updated_cancel_ts - 86400)
+                    # 1. Update the original canceled record
+                    updated_record = record.copy()
+                    updated_record.update({
+                        "created": updated_synthetic,
+                        "updated": updated_cancel_ts
+                    })
+                    q.put(updated_record)
+                    # 2. Create synthetic "active" record (1 day before cancellation)
+                    synthetic_record = record.copy()
+                    synthetic_record.update({
+                        "status": "active",
+                        "created": updated_synthetic,
+                        "updated": updated_synthetic,
+                        "cancel_at": None,
+                        "canceled_at": None
+                    })
+                    q.put(synthetic_record)
+                else:
+                    q.put(record)
+            q.put(None)
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             for s in slices:
@@ -378,124 +398,6 @@ class BoundedThreadedCreatedCursorIncrementalStripeStream(CreatedCursorIncrement
                     finished += 1
                 else:
                     yield item
-class ThreadedCreatedCursorIncrementalStripeStream(CreatedCursorIncrementalStripeStream):
-    is_resumable = True
-    state_checkpoint_interval = math.inf
-
-    def __init__(
-        self,
-        *args,
-        lookback_window_days: int = 0,
-        start_date_max_days_from_now: Optional[int] = None,
-        cursor_field: str = "created",
-        is_search_api: bool = False,
-        max_workers: int = 20,
-        **kwargs,
-    ):
-        self._cursor_field = cursor_field
-        self.is_search_api = is_search_api
-        self.max_workers = max_workers
-        super().__init__(*args, **kwargs)
-        self.lookback_window_days = lookback_window_days
-        self.start_date_max_days_from_now = start_date_max_days_from_now
-
-    def request_params(
-        self,
-        stream_state: Mapping[str, Any],
-        stream_slice: Mapping[str, Any] = None,
-        next_page_token: Mapping[str, Any] = None,
-    ) -> MutableMapping[str, Any]:
-
-        if self.is_search_api:
-            params = {
-                **(self.extra_request_params(
-                    stream_state=stream_state,
-                    stream_slice=stream_slice,
-                    next_page_token=next_page_token
-                ) or {}),
-                "limit": 100
-            }
-            if next_page_token:
-                params["page"] = next_page_token["page"]
-            if self.expand_items:
-                params["expand[]"] = self.expand_items
-            return params
-
-        else:
-            params = super(CreatedCursorIncrementalStripeStream, self).request_params(
-                stream_state, stream_slice, next_page_token
-            )
-            return {
-                "created[gte]": stream_slice["created[gte]"],
-                "created[lte]": stream_slice["created[lte]"],
-                **params
-            }
-
-    def next_page_token(self, response: requests.Response) -> Optional[Mapping[str, Any]]:
-        json_resp = response.json()
-
-        if self.is_search_api:
-            if json_resp.get("has_more") and "next_page" in json_resp:
-                return {"page": json_resp["next_page"]}
-            return None
-        else:
-            if json_resp.get("has_more") and json_resp.get("data"):
-                return {"starting_after": json_resp["data"][-1]["id"]}
-            return None
-
-    def stream_slices(
-        self, sync_mode: SyncMode, cursor_field: List[str] = None, stream_state: Mapping[str, Any] = None
-    ) -> Iterable[Optional[Mapping[str, Any]]]:
-        stream_state = stream_state or {}
-        start_ts = self.get_start_timestamp(stream_state)
-        if start_ts >= pendulum.now().int_timestamp:
-            return []
-        slices = [
-            {"created[gte]": start, "created[lte]": end}
-            for start, end in self.chunk_dates(start_ts)
-        ]
-
-        return [{"batched_slices": slices}]
-
-    def chunk_dates(self, start_date_ts: int) -> Iterable[Tuple[int, int]]:
-        now = pendulum.now().int_timestamp
-        step = int(pendulum.duration(days=self.slice_range).total_seconds())
-        after_ts = start_date_ts
-        while after_ts < now:
-            before_ts = min(now, after_ts + step)
-            yield after_ts, before_ts
-            after_ts = before_ts + 1
-
-    def _read_slice(self, stream_slice, sync_mode, cursor_field, stream_state):
-        return list(super().read_records(
-            sync_mode=sync_mode,
-            cursor_field=cursor_field,
-            stream_slice=stream_slice,
-            stream_state=stream_state,
-        ))
-
-    def read_records(
-        self,
-        sync_mode: SyncMode,
-        cursor_field: Optional[List[str]] = None,
-        stream_slice: Optional[Mapping[str, Any]] = None,
-        stream_state: Optional[Mapping[str, Any]] = None,
-    ) -> Iterable[StreamData]:
-        """
-        Run all stream slices concurrently during full refresh or initial sync.
-        Ignore Airbyte's default slice-by-slice invocation pattern.
-        """
-        stream_state = stream_state or {}
-        slices = stream_slice["batched_slices"]
-        _max_workers =  min(len(slices), self.max_workers)
-        self.logger.info(f"{len(slices)} slices to process with {_max_workers} threads!!!")
-
-        with ThreadPoolExecutor(max_workers=_max_workers) as thread_pool:
-            tasks = {
-                thread_pool.submit(self._read_slice, s, sync_mode, cursor_field, stream_state): s for s in slices
-            }
-            for task in as_completed(tasks):
-                yield from task.result()
 class ThreadedIncrementalStripeStreamSelector(IStreamSelector):
     def __init__(
         self,
@@ -518,45 +420,11 @@ class CustomerBalanceTransactions(ParentIncrementalStripeSubStream):
         super().__init__(cursor_field=cursor_field, parent=None, *args, **kwargs)
         self.customerStream = customerStream
         self.invoiceStream = invoiceStream
-        self.workers = max_workers
-        self.batch_size = 50
-
-    def stream_slices(self, sync_mode: SyncMode, cursor_field=None, stream_state=None):
-        if stream_state:
-            self.parent_streams = [self.customerStream, self.invoiceStream]
-            normalized_state = self.normalize_state(stream_state)
-        else:
-            stream_state = {}
-            self.parent_streams = [self.customerStream]
-            normalized_state = stream_state
-        seen = set()
-        any_records = False
-
-        self.logger.info(f"[CBT] Running parent streams")
-        for parent in self.parent_streams:
-            slices = parent.stream_slices(sync_mode=sync_mode, cursor_field=parent.cursor_field, stream_state=normalized_state)
-            for stream_slice in slices:
-                parent_records = parent.read_records(
-                    sync_mode=sync_mode, cursor_field=cursor_field, stream_slice=stream_slice, stream_state=normalized_state
-                )
-                for record in parent_records:
-                    parent_id = record.get("customer") or record.get("id")
-                    balance = record.get("balance") or record.get("total", 0)
-                    if parent_id and parent_id not in seen and balance != 0:
-                        seen.add(parent_id)
-                        any_records = True
-                        yield {"parent": {"id": parent_id}}
-
-            if not any_records:
-                yield {"parent": {"id": "empty_slice"}}
-
-    def read_records(self, sync_mode, cursor_field=None, stream_slice=None, stream_state=None):
-        state = self.normalize_state(stream_state)
-        lookback = state["cursor"] - int(timedelta(days=1).total_seconds())
-
-        for record in super().read_records(sync_mode, cursor_field, stream_slice, stream_state):
-            if record.get("created", 0) > lookback:
-                yield record
+        self.max_workers = max_workers
+        self.batch_size = 500
+        self.queue_size: int = 10000
+        self._balance_filter_enabled = True
+        self.parent_streams = [self.customerStream, self.invoiceStream]
 
     def normalize_state(self, state: Optional[Mapping[str, Any]]) -> dict:
         """Unifies legacy and new state format."""
@@ -585,3 +453,76 @@ class CustomerBalanceTransactions(ParentIncrementalStripeSubStream):
             "cursor": new_cursor,
             "parents": updated_parents
         }
+
+    def stream_slices(self, sync_mode: SyncMode, cursor_field=None, stream_state=None):
+        normalized_state = self.normalize_state(stream_state) if stream_state else {}
+
+        if stream_state:
+            self.logger.info(f"[CBT] Running in FullRefresh mode")
+            self._balance_filter_enabled = False
+            self.parent_streams = [self.customerStream]
+        else:
+            self.logger.info(f"[CBT] Running in Incremental mode")
+            self._balance_filter_enabled = True
+            self.parent_streams = [self.customerStream, self.invoiceStream]
+
+        seen = set()
+        any_records = False
+        buffer = []
+
+        self.logger.info(f"[CBT] Running parent streams")
+        for parent in self.parent_streams:
+            slices = parent.stream_slices(sync_mode=sync_mode, cursor_field=parent.cursor_field, stream_state=normalized_state)
+            for stream_slice in slices:
+                parent_records = parent.read_records(
+                    sync_mode=sync_mode, cursor_field=cursor_field, stream_slice=stream_slice, stream_state=normalized_state
+                )
+                for record in parent_records:
+                    parent_id = record.get("customer") or record.get("id")
+                    balance_filter = ((record.get("balance") or record.get("total", 0)) != 0) if self._balance_filter_enabled else True
+                    if parent_id and parent_id not in seen and balance_filter:
+                        seen.add(parent_id)
+                        any_records = True
+                        buffer.append({"id": parent_id})
+                        if len(buffer) >= self.batch_size:
+                            yield {"batched_parents": buffer}
+                            buffer = []
+                        #yield {"parent": {"id": parent_id}}
+
+            if not any_records:
+                yield {"batched_parents": {"id": "empty_slice"}}
+            if buffer:
+                yield {"batched_parents": buffer}
+
+    def _process_parent(self, parent_record: Mapping[str, Any], sync_mode, cursor_field, stream_state):
+        sl = StreamSlice(partition={"parent": parent_record}, cursor_slice={})
+        yield from super().read_records(sync_mode, cursor_field, sl, stream_state)
+
+    def read_records(
+        self,
+        sync_mode: SyncMode,
+        cursor_field: Optional[str] = None,
+        stream_slice: Optional[Mapping[str, Any]] = None,
+        stream_state: Optional[Mapping[str, Any]] = None
+    ) -> Iterable[Mapping[str, Any]]:
+        state = stream_state or {}
+        batch = stream_slice["batched_parents"]
+
+        q = queue.Queue(maxsize=self.queue_size)
+        finished = 0
+
+        def worker(pr):
+            for out in self._process_parent(pr, sync_mode, cursor_field, state):
+                q.put(out)
+            q.put(None)
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+            for pr in batch:
+                pool.submit(worker, pr)
+
+            while finished < len(batch):
+                item = q.get()
+                if item is None:
+                    finished += 1
+                else:
+                    yield item
